@@ -3,11 +3,13 @@
 ADB Debugging must be enabled.
 """
 
+import asyncio
 import logging
 
 from .basetv import BaseTV
 from .. import constants
 from ..adb_manager.adb_manager_async import ADBPythonAsync, ADBServerAsync
+from ..framebuffer import COMPRESSED_SCREENCAP_COMMAND, UnsupportedScreencapFormatError, decode_compressed_screencap
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -155,6 +157,36 @@ class BaseTVAsync(BaseTV):
 
         """
         return await self._adb.screencap()
+
+    async def adb_screencap_compressed(self):
+        """Take a screencap as PNG, transferring the framebuffer gzip-compressed.
+
+        Unlike :py:meth:`adb_screencap`, the device does not encode the PNG itself. The raw
+        framebuffer is compressed on the device and the PNG is encoded on the host, which is
+        much faster on most devices. The host-side decode runs in an executor. Falls back to
+        :py:meth:`adb_screencap` when the device lacks ``gzip`` or ``base64``, or when the
+        framebuffer pixel format is not supported.
+
+        Returns
+        -------
+        bytes, None
+            The screencap as a binary .png image, or ``None`` if the device did not return text
+
+        Raises
+        ------
+        androidtv.framebuffer.ScreencapError
+            If the compressed screencap is corrupt or truncated
+
+        """
+        encoded = await self.adb_shell(COMPRESSED_SCREENCAP_COMMAND)
+        if not isinstance(encoded, str):
+            return None
+        if not encoded.strip():
+            return await self.adb_screencap()
+        try:
+            return await asyncio.get_running_loop().run_in_executor(None, decode_compressed_screencap, encoded)
+        except UnsupportedScreencapFormatError:
+            return await self.adb_screencap()
 
     async def adb_connect(
         self,

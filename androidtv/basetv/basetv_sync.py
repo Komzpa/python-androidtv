@@ -7,6 +7,7 @@ import logging
 
 from .basetv import BaseTV
 from .. import constants
+from ..framebuffer import COMPRESSED_SCREENCAP_COMMAND, UnsupportedScreencapFormatError, decode_compressed_screencap
 from ..adb_manager.adb_manager_sync import ADBPythonSync, ADBServerSync
 
 _LOGGER = logging.getLogger(__name__)
@@ -155,6 +156,35 @@ class BaseTVSync(BaseTV):
 
         """
         return self._adb.screencap()
+
+    def adb_screencap_compressed(self):
+        """Take a screencap as PNG, transferring the framebuffer gzip-compressed.
+
+        Unlike :py:meth:`adb_screencap`, the device does not encode the PNG itself. The raw
+        framebuffer is compressed on the device and the PNG is encoded on the host, which is
+        much faster on most devices. Falls back to :py:meth:`adb_screencap` when the device
+        lacks ``gzip`` or ``base64``, or when the framebuffer pixel format is not supported.
+
+        Returns
+        -------
+        bytes, None
+            The screencap as a binary .png image, or ``None`` if the device did not return text
+
+        Raises
+        ------
+        androidtv.framebuffer.ScreencapError
+            If the compressed screencap is corrupt or truncated
+
+        """
+        encoded = self.adb_shell(COMPRESSED_SCREENCAP_COMMAND)
+        if not isinstance(encoded, str):
+            return None
+        if not encoded.strip():
+            return self.adb_screencap()
+        try:
+            return decode_compressed_screencap(encoded)
+        except UnsupportedScreencapFormatError:
+            return self.adb_screencap()
 
     def adb_connect(
         self,
