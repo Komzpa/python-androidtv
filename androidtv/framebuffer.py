@@ -14,8 +14,7 @@ import zlib
 from array import array
 
 COMPRESSED_SCREENCAP_COMMAND = (
-    "if command -v gzip >/dev/null && command -v base64 >/dev/null; "
-    "then screencap | gzip -1 | base64; fi"
+    "if command -v gzip >/dev/null && command -v base64 >/dev/null; " "then screencap | gzip -1 | base64; fi"
 )
 
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"

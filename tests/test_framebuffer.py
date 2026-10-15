@@ -1,16 +1,15 @@
 import base64
 import gzip
 import struct
-import sys
 import unittest
 import zlib
 from unittest.mock import Mock, patch
 
-
-sys.path.insert(0, "..")
-
 from androidtv import framebuffer
 from androidtv.basetv.basetv_sync import BaseTVSync
+from androidtv.basetv.basetv_async import BaseTVAsync
+from .async_patchers import AsyncMock
+from .async_wrapper import awaiter
 
 
 PNG_IMAGE = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\n\x00\x00\x00\n\x08\x06\x00\x00\x00\x8d2\xcf\xbd\x00\x00\x00\x04sBIT\x08\x08\x08\x08|\x08d\x88\x00\x00\x00\tpHYs\x00\x00\x0fa\x00\x00\x0fa\x01\xa8?\xa7i\x00\x00\x00\x0eIDAT\x18\x95c`\x18\x05\x83\x13\x00\x00\x01\x9a\x00\x01\x16\xca\xd3i\x00\x00\x00\x00IEND\xaeB`\x82"
@@ -160,6 +159,54 @@ class TestAdbScreencap(unittest.TestCase):
             png = self.btv.adb_screencap()
         shell.assert_called_once_with(framebuffer.COMPRESSED_SCREENCAP_COMMAND)
         self.assertEqual(_parse_png(png)[0:2], (1, 1))
+
+
+class TestScreencapFailure(unittest.TestCase):
+    def test_corrupt_frame_keeps_sync_transport(self):
+        btv = BaseTVSync.__new__(BaseTVSync)
+        btv._adb = Mock()
+        encoded = base64.b64encode(bytes.fromhex("1f8b0800000000000003070000000000000000")).decode()
+        with patch.object(btv, "adb_shell", return_value=encoded):
+            self.assertIsNone(btv.adb_screencap())
+        btv._adb.close.assert_not_called()
+        btv._adb.screencap.assert_not_called()
+
+
+class TestAdbScreencapAsync(unittest.TestCase):
+    def setUp(self):
+        self.btv = BaseTVAsync.__new__(BaseTVAsync)
+        self.btv._adb = Mock()
+        self.btv._adb.screencap = AsyncMock(return_value=PNG_IMAGE)
+
+    @awaiter
+    async def test_decodes_compressed_frame(self):
+        raw = _header(1, 1, 1) + bytes([1, 2, 3, 4])
+        encoded = base64.b64encode(gzip.compress(raw)).decode()
+        with patch.object(self.btv, "adb_shell", return_value=encoded, new_callable=AsyncMock):
+            png = await self.btv.adb_screencap()
+        self.assertEqual(_parse_png(png)[3], b"\x00\x01\x02\x03\x04")
+        self.btv._adb.screencap.assert_not_called()
+
+    @awaiter
+    async def test_corrupt_frame_keeps_transport(self):
+        encoded = base64.b64encode(bytes.fromhex("1f8b0800000000000003070000000000000000")).decode()
+        with patch.object(self.btv, "adb_shell", return_value=encoded, new_callable=AsyncMock):
+            self.assertIsNone(await self.btv.adb_screencap())
+        self.btv._adb.close.assert_not_called()
+        self.btv._adb.screencap.assert_not_called()
+
+    @awaiter
+    async def test_unsupported_format_keeps_native_capture(self):
+        encoded = base64.b64encode(gzip.compress(_header(1, 1, 43) + bytes(4))).decode()
+        with patch.object(self.btv, "adb_shell", return_value=encoded, new_callable=AsyncMock):
+            self.assertEqual(await self.btv.adb_screencap(), PNG_IMAGE)
+        self.btv._adb.screencap.assert_called_once_with()
+
+    @awaiter
+    async def test_transport_failure_remains_an_error(self):
+        with patch.object(self.btv, "adb_shell", side_effect=ConnectionResetError, new_callable=AsyncMock):
+            with self.assertRaises(ConnectionResetError):
+                await self.btv.adb_screencap()
 
 
 if __name__ == "__main__":

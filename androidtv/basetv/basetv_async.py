@@ -9,7 +9,12 @@ import logging
 from .basetv import BaseTV
 from .. import constants
 from ..adb_manager.adb_manager_async import ADBPythonAsync, ADBServerAsync
-from ..framebuffer import COMPRESSED_SCREENCAP_COMMAND, UnsupportedScreencapFormatError, decode_compressed_screencap
+from ..framebuffer import (
+    COMPRESSED_SCREENCAP_COMMAND,
+    ScreencapError,
+    UnsupportedScreencapFormatError,
+    decode_compressed_screencap,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -162,10 +167,7 @@ class BaseTVAsync(BaseTV):
         bytes, None
             The screencap as a binary .png image, or ``None`` if the device did not return anything
 
-        Raises
-        ------
-        androidtv.framebuffer.ScreencapError
-            If the compressed screencap is corrupt or truncated
+        Corrupt or truncated captures return ``None`` without closing the ADB connection.
 
         """
         encoded = await self.adb_shell(COMPRESSED_SCREENCAP_COMMAND)
@@ -177,6 +179,9 @@ class BaseTVAsync(BaseTV):
             return await asyncio.get_running_loop().run_in_executor(None, decode_compressed_screencap, encoded)
         except UnsupportedScreencapFormatError:
             return await self._adb.screencap()
+        except ScreencapError as err:
+            _LOGGER.warning("Unable to decode screencap: %s", err)
+            return None
 
     async def adb_connect(
         self,
