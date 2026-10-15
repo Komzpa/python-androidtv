@@ -108,68 +108,111 @@ class TestDecodeFramebuffer(unittest.TestCase):
             framebuffer.decode_framebuffer(_header(0, 1, 1) + bytes(4))
 
 
-class TestDecodeCompressedScreencap(unittest.TestCase):
-    def _encode(self, raw):
-        return base64.b64encode(gzip.compress(raw)).decode()
-
+class TestDecodeGzipScreencap(unittest.TestCase):
     def test_round_trip(self):
         raw = _header(1, 1, 1) + bytes([9, 8, 7, 6])
-        png = framebuffer.decode_compressed_screencap(self._encode(raw))
+        png = framebuffer.decode_gzip_screencap(gzip.compress(raw))
         self.assertEqual(_parse_png(png)[3], b"\x00" + bytes([9, 8, 7, 6]))
 
     def test_corrupt_gzip_raises_screencap_error(self):
-        encoded = base64.b64encode(gzip.compress(_header(1, 1, 1) + bytes(4))[:-6]).decode()
         with self.assertRaises(framebuffer.ScreencapError):
-            framebuffer.decode_compressed_screencap(encoded)
+            framebuffer.decode_gzip_screencap(gzip.compress(_header(1, 1, 1) + bytes(4))[:-6])
 
-    def test_invalid_base64_raises_screencap_error(self):
+    def test_non_gzip_raises_screencap_error(self):
         with self.assertRaises(framebuffer.ScreencapError):
-            framebuffer.decode_compressed_screencap("not base64!")
+            framebuffer.decode_gzip_screencap(b"not gzip at all")
 
     def test_truncated_compressed_frame_raises(self):
         with self.assertRaises(framebuffer.ScreencapError):
-            framebuffer.decode_compressed_screencap(self._encode(bytes(11)))
+            framebuffer.decode_gzip_screencap(gzip.compress(bytes(11)))
+
+    def test_corrupted_gzip_bytes_fail_crc(self):
+        raw = _header(1, 1, 1) + bytes([9, 8, 7, 6])
+        mangled = bytearray(gzip.compress(raw))
+        mangled[10] ^= 0xFF
+        with self.assertRaises(framebuffer.ScreencapError):
+            framebuffer.decode_gzip_screencap(bytes(mangled))
 
 
 class TestAdbScreencap(unittest.TestCase):
     def setUp(self):
         self.btv = BaseTVSync.__new__(BaseTVSync)
         self.btv._adb = Mock()
-
-    def test_returns_none_when_shell_not_text(self):
-        with patch.object(self.btv, "adb_shell", return_value=None):
-            self.assertIsNone(self.btv.adb_screencap())
-
-    def test_falls_back_when_device_has_no_compression(self):
         self.btv._adb.screencap.return_value = PNG_IMAGE
-        with patch.object(self.btv, "adb_shell", return_value=""):
-            self.assertEqual(self.btv.adb_screencap(), PNG_IMAGE)
-            self.btv._adb.screencap.assert_called_once_with()
+        self.raw = _header(1, 1, 1) + bytes([1, 2, 3, 4])
+        self.gzipped = gzip.compress(self.raw)
+        self.btv._adb.shell_binary.side_effect = lambda cmd: (
+            self.raw if cmd == framebuffer.RAW_SCREENCAP_COMMAND else self.gzipped
+        )
 
-    def test_falls_back_for_unsupported_format(self):
-        encoded = base64.b64encode(gzip.compress(_header(1, 1, 43) + bytes(4))).decode()
-        self.btv._adb.screencap.return_value = PNG_IMAGE
-        with patch.object(self.btv, "adb_shell", return_value=encoded):
-            self.assertEqual(self.btv.adb_screencap(), PNG_IMAGE)
-
-    def test_decodes_compressed_frame(self):
-        raw = _header(1, 1, 1) + bytes([1, 2, 3, 4])
-        encoded = base64.b64encode(gzip.compress(raw)).decode()
-        with patch.object(self.btv, "adb_shell", return_value=encoded) as shell:
+    def test_calibration_picks_fastest_raw(self):
+        with patch("androidtv.basetv.basetv_sync.monotonic", side_effect=[0, 1, 1, 5, 5, 6]):
             png = self.btv.adb_screencap()
-        shell.assert_called_once_with(framebuffer.COMPRESSED_SCREENCAP_COMMAND)
         self.assertEqual(_parse_png(png)[0:2], (1, 1))
+        self.assertEqual(self.btv._screencap_method, "raw")
+        self.btv._adb.shell_binary.reset_mock()
+        self.btv._adb.screencap.reset_mock()
+        png = self.btv.adb_screencap()
+        self.assertEqual(_parse_png(png)[0:2], (1, 1))
+        self.btv._adb.shell_binary.assert_called_once_with(framebuffer.RAW_SCREENCAP_COMMAND)
+        self.btv._adb.screencap.assert_not_called()
 
+    def test_calibration_picks_fastest_gzip(self):
+        with patch("androidtv.basetv.basetv_sync.monotonic", side_effect=[0, 5, 5, 6, 6, 10]):
+            png = self.btv.adb_screencap()
+        self.assertEqual(_parse_png(png)[0:2], (1, 1))
+        self.assertEqual(self.btv._screencap_method, "gzip")
+        self.btv._adb.shell_binary.reset_mock()
+        self.btv._adb.screencap.reset_mock()
+        png = self.btv.adb_screencap()
+        self.assertEqual(_parse_png(png)[0:2], (1, 1))
+        self.btv._adb.shell_binary.assert_called_once_with(framebuffer.GZIP_SCREENCAP_COMMAND)
+        self.btv._adb.screencap.assert_not_called()
 
-class TestScreencapFailure(unittest.TestCase):
-    def test_corrupt_frame_keeps_sync_transport(self):
-        btv = BaseTVSync.__new__(BaseTVSync)
-        btv._adb = Mock()
-        encoded = base64.b64encode(bytes.fromhex("1f8b0800000000000003070000000000000000")).decode()
-        with patch.object(btv, "adb_shell", return_value=encoded):
-            self.assertIsNone(btv.adb_screencap())
-        btv._adb.close.assert_not_called()
-        btv._adb.screencap.assert_not_called()
+    def test_calibration_picks_fastest_native(self):
+        with patch("androidtv.basetv.basetv_sync.monotonic", side_effect=[0, 5, 5, 9, 9, 10]):
+            self.assertEqual(self.btv.adb_screencap(), PNG_IMAGE)
+        self.assertEqual(self.btv._screencap_method, "native")
+        self.btv._adb.shell_binary.reset_mock()
+        self.btv._adb.screencap.reset_mock()
+        self.assertEqual(self.btv.adb_screencap(), PNG_IMAGE)
+        self.btv._adb.shell_binary.assert_not_called()
+        self.btv._adb.screencap.assert_called_once_with()
+
+    def test_invalid_candidates_are_discarded(self):
+        mangled_raw = self.raw.replace(b"\n", b"\r\n")
+        if len(mangled_raw) == len(self.raw):
+            mangled_raw = self.raw + b"\r"
+        self.btv._adb.shell_binary.side_effect = lambda cmd: (
+            mangled_raw if cmd == framebuffer.RAW_SCREENCAP_COMMAND else b"not gzip"
+        )
+        with patch("androidtv.basetv.basetv_sync.monotonic", side_effect=[0, 1, 1, 2, 2, 3]):
+            self.assertEqual(self.btv.adb_screencap(), PNG_IMAGE)
+        self.assertEqual(self.btv._screencap_method, "native")
+
+    def test_pinned_failure_falls_back_to_native(self):
+        with patch("androidtv.basetv.basetv_sync.monotonic", side_effect=[0, 1, 1, 5, 5, 6]):
+            self.btv.adb_screencap()
+        self.assertEqual(self.btv._screencap_method, "raw")
+        self.btv._adb.shell_binary.side_effect = lambda cmd: b"garbage"
+        self.assertEqual(self.btv.adb_screencap(), PNG_IMAGE)
+        self.assertEqual(self.btv._screencap_method, "native")
+
+    def test_server_path_without_binary_shell_uses_native(self):
+        del self.btv._adb.shell_binary
+        self.assertEqual(self.btv.adb_screencap(), PNG_IMAGE)
+        self.assertEqual(self.btv._screencap_method, "native")
+
+    def test_reconnect_recalibrates(self):
+        with patch("androidtv.basetv.basetv_sync.monotonic", side_effect=[0, 5, 5, 9, 9, 10]):
+            self.assertEqual(self.btv.adb_screencap(), PNG_IMAGE)
+        self.assertEqual(self.btv._screencap_method, "native")
+        self.btv.adb_connect()
+        self.assertIsNone(self.btv._screencap_method)
+        with patch("androidtv.basetv.basetv_sync.monotonic", side_effect=[0, 1, 1, 5, 5, 6]):
+            png = self.btv.adb_screencap()
+        self.assertEqual(_parse_png(png)[0:2], (1, 1))
+        self.assertEqual(self.btv._screencap_method, "raw")
 
 
 class TestAdbScreencapAsync(unittest.TestCase):
@@ -177,37 +220,96 @@ class TestAdbScreencapAsync(unittest.TestCase):
         self.btv = BaseTVAsync.__new__(BaseTVAsync)
         self.btv._adb = Mock()
         self.btv._adb.screencap = AsyncMock(return_value=PNG_IMAGE)
+        self.btv._adb.connect = AsyncMock(return_value=True)
+        self.raw = _header(1, 1, 1) + bytes([1, 2, 3, 4])
+        self.gzipped = gzip.compress(self.raw)
+        self.btv._adb.shell_binary = AsyncMock(side_effect=self._shell_binary)
+
+    async def _shell_binary(self, cmd):
+        if cmd == framebuffer.RAW_SCREENCAP_COMMAND:
+            return self.raw
+        return self.gzipped
 
     @awaiter
-    async def test_decodes_compressed_frame(self):
-        raw = _header(1, 1, 1) + bytes([1, 2, 3, 4])
-        encoded = base64.b64encode(gzip.compress(raw)).decode()
-        with patch.object(self.btv, "adb_shell", return_value=encoded, new_callable=AsyncMock):
+    async def test_calibration_picks_fastest_raw(self):
+        with patch("androidtv.basetv.basetv_async.monotonic", side_effect=[0, 1, 1, 5, 5, 6]):
             png = await self.btv.adb_screencap()
         self.assertEqual(_parse_png(png)[3], b"\x00\x01\x02\x03\x04")
+        self.assertEqual(self.btv._screencap_method, "raw")
+        self.btv._adb.shell_binary.reset_mock()
+        self.btv._adb.screencap.reset_mock()
+        png = await self.btv.adb_screencap()
+        self.assertEqual(_parse_png(png)[3], b"\x00\x01\x02\x03\x04")
+        self.btv._adb.shell_binary.assert_called_once_with(framebuffer.RAW_SCREENCAP_COMMAND)
         self.btv._adb.screencap.assert_not_called()
 
     @awaiter
-    async def test_corrupt_frame_keeps_transport(self):
-        encoded = base64.b64encode(bytes.fromhex("1f8b0800000000000003070000000000000000")).decode()
-        with patch.object(self.btv, "adb_shell", return_value=encoded, new_callable=AsyncMock):
-            self.assertIsNone(await self.btv.adb_screencap())
-        self.btv._adb.close.assert_not_called()
+    async def test_calibration_picks_fastest_gzip(self):
+        with patch("androidtv.basetv.basetv_async.monotonic", side_effect=[0, 5, 5, 6, 6, 10]):
+            png = await self.btv.adb_screencap()
+        self.assertEqual(_parse_png(png)[3], b"\x00\x01\x02\x03\x04")
+        self.assertEqual(self.btv._screencap_method, "gzip")
+        self.btv._adb.shell_binary.reset_mock()
+        self.btv._adb.screencap.reset_mock()
+        png = await self.btv.adb_screencap()
+        self.assertEqual(_parse_png(png)[3], b"\x00\x01\x02\x03\x04")
+        self.btv._adb.shell_binary.assert_called_once_with(framebuffer.GZIP_SCREENCAP_COMMAND)
         self.btv._adb.screencap.assert_not_called()
 
     @awaiter
-    async def test_unsupported_format_keeps_native_capture(self):
-        encoded = base64.b64encode(gzip.compress(_header(1, 1, 43) + bytes(4))).decode()
-        with patch.object(self.btv, "adb_shell", return_value=encoded, new_callable=AsyncMock):
+    async def test_calibration_picks_fastest_native(self):
+        with patch("androidtv.basetv.basetv_async.monotonic", side_effect=[0, 5, 5, 9, 9, 10]):
             self.assertEqual(await self.btv.adb_screencap(), PNG_IMAGE)
+        self.assertEqual(self.btv._screencap_method, "native")
+        self.btv._adb.shell_binary.reset_mock()
+        self.btv._adb.screencap.reset_mock()
+        self.assertEqual(await self.btv.adb_screencap(), PNG_IMAGE)
+        self.btv._adb.shell_binary.assert_not_called()
         self.btv._adb.screencap.assert_called_once_with()
 
     @awaiter
+    async def test_invalid_candidates_are_discarded(self):
+        mangled_raw = self.raw.replace(b"\n", b"\r\n")
+        if len(mangled_raw) == len(self.raw):
+            mangled_raw = self.raw + b"\r"
+
+        async def bad_shell(cmd):
+            return mangled_raw if cmd == framebuffer.RAW_SCREENCAP_COMMAND else b"not gzip"
+
+        self.btv._adb.shell_binary = AsyncMock(side_effect=bad_shell)
+        with patch("androidtv.basetv.basetv_async.monotonic", side_effect=[0, 1, 1, 2, 2, 3]):
+            self.assertEqual(await self.btv.adb_screencap(), PNG_IMAGE)
+        self.assertEqual(self.btv._screencap_method, "native")
+
+    @awaiter
+    async def test_pinned_failure_falls_back_to_native(self):
+        with patch("androidtv.basetv.basetv_async.monotonic", side_effect=[0, 1, 1, 5, 5, 6]):
+            await self.btv.adb_screencap()
+        self.assertEqual(self.btv._screencap_method, "raw")
+        self.btv._adb.shell_binary = AsyncMock(return_value=b"garbage")
+        self.assertEqual(await self.btv.adb_screencap(), PNG_IMAGE)
+        self.assertEqual(self.btv._screencap_method, "native")
+
+    @awaiter
+    async def test_server_path_without_binary_shell_uses_native(self):
+        del self.btv._adb.shell_binary
+        self.assertEqual(await self.btv.adb_screencap(), PNG_IMAGE)
+        self.assertEqual(self.btv._screencap_method, "native")
+
+    @awaiter
+    async def test_reconnect_recalibrates(self):
+        with patch("androidtv.basetv.basetv_async.monotonic", side_effect=[0, 5, 5, 9, 9, 10]):
+            self.assertEqual(await self.btv.adb_screencap(), PNG_IMAGE)
+        self.assertEqual(self.btv._screencap_method, "native")
+        await self.btv.adb_connect()
+        self.assertIsNone(self.btv._screencap_method)
+        with patch("androidtv.basetv.basetv_async.monotonic", side_effect=[0, 1, 1, 5, 5, 6]):
+            png = await self.btv.adb_screencap()
+        self.assertEqual(_parse_png(png)[3], b"\x00\x01\x02\x03\x04")
+        self.assertEqual(self.btv._screencap_method, "raw")
+
+    @awaiter
     async def test_transport_failure_remains_an_error(self):
-        with patch.object(self.btv, "adb_shell", side_effect=ConnectionResetError, new_callable=AsyncMock):
-            with self.assertRaises(ConnectionResetError):
-                await self.btv.adb_screencap()
-
-
-if __name__ == "__main__":
-    unittest.main()
+        self.btv._adb.shell_binary = AsyncMock(side_effect=ConnectionResetError)
+        with self.assertRaises(ConnectionResetError):
+            await self.btv.adb_screencap()

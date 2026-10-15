@@ -1,21 +1,25 @@
-"""Capture Android framebuffers compressed over ADB and encode them as PNG.
+"""Capture Android framebuffers over ADB and encode them as PNG.
 
-``screencap -p`` makes the device CPU encode the PNG, which is slow on many
-TVs. Piping the raw framebuffer through ``gzip`` and ``base64`` is much faster;
-the host then parses the Android framebuffer header and encodes the PNG itself
-using only the standard library.
+``screencap -p`` makes the device CPU encode the PNG. Two binary alternatives
+avoid that: plain ``screencap`` (raw pixels, decoded on the host) and
+``screencap | gzip -1`` (raw pixels gzipped on the device). Neither path is
+always faster: on one Hi3751V350 projector the medians were 7.4 s for
+``screencap -p``, about 2.5 s for raw ``screencap`` read binary (0.7 s grab
+plus transfer of 8.3 MB), and about 4.1 s for the gzip path. Callers time each
+path back to back on first use and keep the fastest valid one for that
+device. The host parses the Android framebuffer header and encodes the PNG
+itself using only the standard library.
 """
 
-import base64
 import gzip
 import struct
 import sys
 import zlib
 from array import array
 
-COMPRESSED_SCREENCAP_COMMAND = (
-    "if command -v gzip >/dev/null && command -v base64 >/dev/null; " "then screencap | gzip -1 | base64; fi"
-)
+RAW_SCREENCAP_COMMAND = "screencap"
+
+GZIP_SCREENCAP_COMMAND = "screencap | gzip -1"
 
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 
@@ -34,13 +38,13 @@ class UnsupportedScreencapFormatError(ScreencapError):
     """The framebuffer uses a pixel format this decoder does not handle."""
 
 
-def decode_compressed_screencap(encoded):
-    """Decode the base64-encoded gzip output of :data:`COMPRESSED_SCREENCAP_COMMAND`.
+def decode_gzip_screencap(data):
+    """Decode the raw gzip output of :data:`GZIP_SCREENCAP_COMMAND`.
 
     Parameters
     ----------
-    encoded : str
-        The text printed by the device shell
+    data : bytes
+        The raw bytes printed by the device shell
 
     Returns
     -------
@@ -50,15 +54,15 @@ def decode_compressed_screencap(encoded):
     Raises
     ------
     ScreencapError
-        If the data is not valid base64/gzip or the framebuffer is truncated
+        If the data is not valid gzip or the framebuffer is truncated
     UnsupportedScreencapFormatError
         If the framebuffer pixel format is not supported
 
     """
     try:
-        raw = gzip.decompress(base64.b64decode(encoded))
+        raw = gzip.decompress(data)
     except (ValueError, OSError, EOFError, zlib.error) as err:
-        raise ScreencapError(f"Corrupt compressed screencap: {err}") from err
+        raise ScreencapError(f"Corrupt gzip screencap: {err}") from err
     return decode_framebuffer(raw)
 
 

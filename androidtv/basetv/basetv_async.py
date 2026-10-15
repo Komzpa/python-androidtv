@@ -5,15 +5,17 @@ ADB Debugging must be enabled.
 
 import asyncio
 import logging
+from time import monotonic
 
 from .basetv import BaseTV
 from .. import constants
 from ..adb_manager.adb_manager_async import ADBPythonAsync, ADBServerAsync
 from ..framebuffer import (
-    COMPRESSED_SCREENCAP_COMMAND,
+    GZIP_SCREENCAP_COMMAND,
+    RAW_SCREENCAP_COMMAND,
     ScreencapError,
-    UnsupportedScreencapFormatError,
-    decode_compressed_screencap,
+    decode_framebuffer,
+    decode_gzip_screencap,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -92,6 +94,7 @@ class BaseTVAsync(BaseTV):
             adb = ADBServerAsync(host, port, adb_server_ip, adb_server_port)
 
         BaseTV.__init__(self, adb, host, port, adbkey, adb_server_ip, adb_server_port, state_detection_rules)
+        self._screencap_method = None
 
     # ======================================================================= #
     #                                                                         #
@@ -154,34 +157,106 @@ class BaseTVAsync(BaseTV):
 
         Returns the screen as a binary .png image, or ``None`` if the device did not return anything.
 
-        Note: the raw framebuffer is transferred gzip-compressed and the PNG is encoded on the host with the
-        standard library (the host-side decode runs in an executor), which is much faster than having the
-        device encode the PNG itself. If the device lacks ``gzip`` or ``base64``, or the framebuffer pixel
-        format is not supported, the device-side ``screencap -p`` path is used instead
+        Note: there are three capture paths. Plain ``screencap`` and ``screencap | gzip -1`` are read
+        back as raw bytes (:py:meth:`androidtv.adb_manager.adb_manager_async.ADBPythonAsync.shell_binary`)
+        with the PNG encoded on the host (the host-side decode runs in an executor); or the device encodes
+        the PNG itself via device-side ``screencap -p``
         (:py:meth:`androidtv.adb_manager.adb_manager_async.ADBPythonAsync.screencap` or
         :py:meth:`androidtv.adb_manager.adb_manager_async.ADBServerAsync.screencap`, depending on whether the
-        Python ADB implementation or an ADB server is used for communicating with the device).
+        Python ADB implementation or an ADB server is used for communicating with the device). The ADB
+        server path has no binary shell, so it uses only device-side ``screencap -p``. Neither path is
+        always faster. The first call after :meth:`adb_connect` times each binary-safe candidate back to
+        back, discards any candidate that fails validation, pins the fastest valid one, and returns its
+        image; later calls use only the pinned method. If the pinned binary method later fails, it falls
+        back to device-side ``screencap -p`` and pins that for good.
 
         Returns
         -------
         bytes, None
             The screencap as a binary .png image, or ``None`` if the device did not return anything
 
-        Corrupt or truncated captures return ``None`` without closing the ADB connection.
-
         """
-        encoded = await self.adb_shell(COMPRESSED_SCREENCAP_COMMAND)
-        if not isinstance(encoded, str):
+        method = getattr(self, "_screencap_method", None)
+        if method == "native":
+            return await self._adb.screencap()
+        if method == "raw":
+            return await self._raw_screencap()
+        if method == "gzip":
+            return await self._gzip_screencap()
+        return await self._calibrate_screencap()
+
+    async def _binary_shell(self, cmd):
+        """Run a shell command and return raw bytes, or ``None`` when the path has no binary shell."""
+        shell_binary = getattr(self._adb, "shell_binary", None)
+        if shell_binary is None:
             return None
-        if not encoded.strip():
+        return await shell_binary(cmd)
+
+    async def _raw_screencap(self):
+        """Run the raw path, falling back to device-side ``screencap -p`` on any decode failure."""
+        data = await self._binary_shell(RAW_SCREENCAP_COMMAND)
+        if not isinstance(data, bytes) or not data:
+            self._screencap_method = "native"
             return await self._adb.screencap()
         try:
-            return await asyncio.get_running_loop().run_in_executor(None, decode_compressed_screencap, encoded)
-        except UnsupportedScreencapFormatError:
-            return await self._adb.screencap()
+            return await asyncio.get_running_loop().run_in_executor(None, decode_framebuffer, data)
         except ScreencapError as err:
-            _LOGGER.warning("Unable to decode screencap: %s", err)
+            _LOGGER.debug("Falling back to screencap -p: %s", err)
+            self._screencap_method = "native"
+            return await self._adb.screencap()
+
+    async def _gzip_screencap(self):
+        """Run the gzip path, falling back to device-side ``screencap -p`` on any decode failure."""
+        data = await self._binary_shell(GZIP_SCREENCAP_COMMAND)
+        if not isinstance(data, bytes) or not data:
+            self._screencap_method = "native"
+            return await self._adb.screencap()
+        try:
+            return await asyncio.get_running_loop().run_in_executor(None, decode_gzip_screencap, data)
+        except ScreencapError as err:
+            _LOGGER.debug("Falling back to screencap -p: %s", err)
+            self._screencap_method = "native"
+            return await self._adb.screencap()
+
+    async def _calibrate_screencap(self):
+        """Time each binary-safe candidate back to back, pin the fastest valid one, return its image."""
+        loop = asyncio.get_running_loop()
+        results = {}
+        binary_shell = getattr(self._adb, "shell_binary", None)
+        if binary_shell is None:
+            _LOGGER.debug("ADB server has no binary shell; using screencap -p")
+            self._screencap_method = "native"
+            return await self._adb.screencap()
+        for name, cmd, decode in (
+            ("raw", RAW_SCREENCAP_COMMAND, decode_framebuffer),
+            ("gzip", GZIP_SCREENCAP_COMMAND, decode_gzip_screencap),
+        ):
+            start = monotonic()
+            data = await binary_shell(cmd)
+            if isinstance(data, bytes) and data:
+                try:
+                    image = await loop.run_in_executor(None, decode, data)
+                except ScreencapError as err:
+                    _LOGGER.debug("Screencap candidate %r failed validation: %s", name, err)
+                else:
+                    results[name] = (monotonic() - start, image)
+                    continue
+            _LOGGER.debug("Screencap candidate %r returned no data", name)
+        start = monotonic()
+        native_image = await self._adb.screencap()
+        native_dt = monotonic() - start
+        if native_image is not None:
+            results["native"] = (native_dt, native_image)
+        _LOGGER.debug(
+            "Screencap calibration: %s",
+            ", ".join(f"{name} {dt:.3f}s" for name, (dt, _) in sorted(results.items(), key=lambda kv: kv[1][0])),
+        )
+        if not results:
+            self._screencap_method = "native"
             return None
+        name = min(results, key=lambda key: results[key][0])
+        self._screencap_method = name
+        return results[name][1]
 
     async def adb_connect(
         self,
@@ -206,6 +281,7 @@ class BaseTVAsync(BaseTV):
             Whether or not the connection was successfully established and the device is available
 
         """
+        self._screencap_method = None
         if isinstance(self._adb, ADBPythonAsync):
             return await self._adb.connect(log_errors, auth_timeout_s, transport_timeout_s)
         return await self._adb.connect(log_errors)
