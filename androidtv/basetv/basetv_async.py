@@ -3,11 +3,13 @@
 ADB Debugging must be enabled.
 """
 
+import asyncio
 import logging
 
 from .basetv import BaseTV
 from .. import constants
 from ..adb_manager.adb_manager_async import ADBPythonAsync, ADBServerAsync
+from ..framebuffer import COMPRESSED_SCREENCAP_COMMAND, UnsupportedScreencapFormatError, decode_compressed_screencap
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -145,16 +147,36 @@ class BaseTVAsync(BaseTV):
     async def adb_screencap(self):
         """Take a screencap.
 
-        This calls :py:meth:`androidtv.adb_manager.adb_manager_async.ADBPythonAsync.screencap` or :py:meth:`androidtv.adb_manager.adb_manager_async.ADBServerAsync.screencap`,
-        depending on whether the Python ADB implementation or an ADB server is used for communicating with the device.
+        Returns the screen as a binary .png image, or ``None`` if the device did not return anything.
+
+        Note: the raw framebuffer is transferred gzip-compressed and the PNG is encoded on the host with the
+        standard library (the host-side decode runs in an executor), which is much faster than having the
+        device encode the PNG itself. If the device lacks ``gzip`` or ``base64``, or the framebuffer pixel
+        format is not supported, the device-side ``screencap -p`` path is used instead
+        (:py:meth:`androidtv.adb_manager.adb_manager_async.ADBPythonAsync.screencap` or
+        :py:meth:`androidtv.adb_manager.adb_manager_async.ADBServerAsync.screencap`, depending on whether the
+        Python ADB implementation or an ADB server is used for communicating with the device).
 
         Returns
         -------
-        bytes
-            The screencap as a binary .png image
+        bytes, None
+            The screencap as a binary .png image, or ``None`` if the device did not return anything
+
+        Raises
+        ------
+        androidtv.framebuffer.ScreencapError
+            If the compressed screencap is corrupt or truncated
 
         """
-        return await self._adb.screencap()
+        encoded = await self.adb_shell(COMPRESSED_SCREENCAP_COMMAND)
+        if not isinstance(encoded, str):
+            return None
+        if not encoded.strip():
+            return await self._adb.screencap()
+        try:
+            return await asyncio.get_running_loop().run_in_executor(None, decode_compressed_screencap, encoded)
+        except UnsupportedScreencapFormatError:
+            return await self._adb.screencap()
 
     async def adb_connect(
         self,

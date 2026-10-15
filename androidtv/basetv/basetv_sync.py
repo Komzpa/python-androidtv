@@ -7,6 +7,7 @@ import logging
 
 from .basetv import BaseTV
 from .. import constants
+from ..framebuffer import COMPRESSED_SCREENCAP_COMMAND, UnsupportedScreencapFormatError, decode_compressed_screencap
 from ..adb_manager.adb_manager_sync import ADBPythonSync, ADBServerSync
 
 _LOGGER = logging.getLogger(__name__)
@@ -145,16 +146,35 @@ class BaseTVSync(BaseTV):
     def adb_screencap(self):
         """Take a screencap.
 
-        This calls :py:meth:`androidtv.adb_manager.adb_manager_sync.ADBPythonSync.screencap` or :py:meth:`androidtv.adb_manager.adb_manager_sync.ADBServerSync.screencap`,
-        depending on whether the Python ADB implementation or an ADB server is used for communicating with the device.
+        Returns the screen as a binary .png image, or ``None`` if the device did not return anything.
+
+        Note: the raw framebuffer is transferred gzip-compressed and the PNG is encoded on the host with the
+        standard library, which is much faster than having the device encode the PNG itself. If the device
+        lacks ``gzip`` or ``base64``, or the framebuffer pixel format is not supported, the device-side
+        ``screencap -p`` path is used instead (:py:meth:`androidtv.adb_manager.adb_manager_sync.ADBPythonSync.screencap`
+        or :py:meth:`androidtv.adb_manager.adb_manager_sync.ADBServerSync.screencap`, depending on whether the
+        Python ADB implementation or an ADB server is used for communicating with the device).
 
         Returns
         -------
-        bytes
-            The screencap as a binary .png image
+        bytes, None
+            The screencap as a binary .png image, or ``None`` if the device did not return anything
+
+        Raises
+        ------
+        androidtv.framebuffer.ScreencapError
+            If the compressed screencap is corrupt or truncated
 
         """
-        return self._adb.screencap()
+        encoded = self.adb_shell(COMPRESSED_SCREENCAP_COMMAND)
+        if not isinstance(encoded, str):
+            return None
+        if not encoded.strip():
+            return self._adb.screencap()
+        try:
+            return decode_compressed_screencap(encoded)
+        except UnsupportedScreencapFormatError:
+            return self._adb.screencap()
 
     def adb_connect(
         self,
