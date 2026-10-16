@@ -215,6 +215,139 @@ class TestAdbScreencap(unittest.TestCase):
         self.assertEqual(self.btv._screencap_method, "raw")
 
 
+class TestAdbScreencapFallbacks(unittest.TestCase):
+    def setUp(self):
+        self.btv = BaseTVSync.__new__(BaseTVSync)
+        self.btv._adb = Mock()
+        self.btv._adb.screencap.return_value = PNG_IMAGE
+        self.raw = _header(1, 1, 1) + bytes([1, 2, 3, 4])
+        self.gzipped = gzip.compress(self.raw)
+
+    def test_pinned_raw_empty_output_uses_native(self):
+        self.btv._screencap_method = "raw"
+        self.btv._adb.shell_binary.return_value = b""
+        self.assertEqual(self.btv.adb_screencap(), PNG_IMAGE)
+        self.assertEqual(self.btv._screencap_method, "native")
+
+    def test_pinned_raw_none_output_uses_native(self):
+        self.btv._screencap_method = "raw"
+        self.btv._adb.shell_binary.return_value = None
+        self.assertEqual(self.btv.adb_screencap(), PNG_IMAGE)
+        self.assertEqual(self.btv._screencap_method, "native")
+
+    def test_pinned_gzip_empty_output_uses_native(self):
+        self.btv._screencap_method = "gzip"
+        self.btv._adb.shell_binary.return_value = b""
+        self.assertEqual(self.btv.adb_screencap(), PNG_IMAGE)
+        self.assertEqual(self.btv._screencap_method, "native")
+
+    def test_pinned_gzip_decode_failure_uses_native(self):
+        self.btv._screencap_method = "gzip"
+        self.btv._adb.shell_binary.return_value = b"not gzip"
+        self.assertEqual(self.btv.adb_screencap(), PNG_IMAGE)
+        self.assertEqual(self.btv._screencap_method, "native")
+
+    def test_pinned_gzip_without_binary_shell_uses_native(self):
+        self.btv._screencap_method = "gzip"
+        del self.btv._adb.shell_binary
+        self.assertEqual(self.btv.adb_screencap(), PNG_IMAGE)
+        self.assertEqual(self.btv._screencap_method, "native")
+
+    def test_calibration_without_binary_shell_uses_native(self):
+        del self.btv._adb.shell_binary
+        self.assertEqual(self.btv.adb_screencap(), PNG_IMAGE)
+        self.assertEqual(self.btv._screencap_method, "native")
+
+    def test_calibration_without_any_valid_candidate_returns_none(self):
+        self.btv._adb.shell_binary.return_value = b""
+        self.btv._adb.screencap.return_value = None
+        with patch("androidtv.basetv.basetv_sync.monotonic", side_effect=range(10)):
+            self.assertIsNone(self.btv.adb_screencap())
+        self.assertEqual(self.btv._screencap_method, "native")
+
+    def test_calibration_skips_undecodable_candidate(self):
+        self.btv._adb.shell_binary.side_effect = lambda cmd: (
+            b"garbage" if cmd == framebuffer.RAW_SCREENCAP_COMMAND else self.gzipped
+        )
+        with patch("androidtv.basetv.basetv_sync.monotonic", side_effect=[0, 1, 5, 5, 6]):
+            self.assertEqual(self.btv.adb_screencap(), PNG_IMAGE)
+        self.assertEqual(self.btv._screencap_method, "native")
+
+
+class TestAdbScreencapFallbacksAsync(unittest.TestCase):
+    def setUp(self):
+        self.btv = BaseTVAsync.__new__(BaseTVAsync)
+        self.btv._adb = Mock()
+        self.btv._adb.screencap = AsyncMock(return_value=PNG_IMAGE)
+        self.raw = _header(1, 1, 1) + bytes([1, 2, 3, 4])
+        self.gzipped = gzip.compress(self.raw)
+
+    @awaiter
+    async def test_pinned_raw_empty_output_uses_native(self):
+        self.btv._screencap_method = "raw"
+        self.btv._adb.shell_binary = AsyncMock(return_value=b"")
+        self.assertEqual(await self.btv.adb_screencap(), PNG_IMAGE)
+        self.assertEqual(self.btv._screencap_method, "native")
+
+    @awaiter
+    async def test_pinned_raw_none_output_uses_native(self):
+        self.btv._screencap_method = "raw"
+        self.btv._adb.shell_binary = AsyncMock(return_value=None)
+        self.assertEqual(await self.btv.adb_screencap(), PNG_IMAGE)
+        self.assertEqual(self.btv._screencap_method, "native")
+
+    @awaiter
+    async def test_pinned_gzip_empty_output_uses_native(self):
+        self.btv._screencap_method = "gzip"
+        self.btv._adb.shell_binary = AsyncMock(return_value=b"")
+        self.assertEqual(await self.btv.adb_screencap(), PNG_IMAGE)
+        self.assertEqual(self.btv._screencap_method, "native")
+
+    @awaiter
+    async def test_pinned_gzip_decode_failure_uses_native(self):
+        self.btv._screencap_method = "gzip"
+        self.btv._adb.shell_binary = AsyncMock(return_value=b"not gzip")
+        self.assertEqual(await self.btv.adb_screencap(), PNG_IMAGE)
+        self.assertEqual(self.btv._screencap_method, "native")
+
+    @awaiter
+    async def test_pinned_gzip_without_binary_shell_uses_native(self):
+        self.btv._screencap_method = "gzip"
+        del self.btv._adb.shell_binary
+        self.assertEqual(await self.btv.adb_screencap(), PNG_IMAGE)
+        self.assertEqual(self.btv._screencap_method, "native")
+
+    @awaiter
+    async def test_calibration_without_binary_shell_uses_native(self):
+        del self.btv._adb.shell_binary
+        self.assertEqual(await self.btv.adb_screencap(), PNG_IMAGE)
+        self.assertEqual(self.btv._screencap_method, "native")
+
+    @awaiter
+    async def test_calibration_without_any_valid_candidate_returns_none(self):
+        self.btv._adb.shell_binary = AsyncMock(return_value=b"")
+        self.btv._adb.screencap = AsyncMock(return_value=None)
+        with patch("androidtv.basetv.basetv_async.monotonic", side_effect=range(10)):
+            self.assertIsNone(await self.btv.adb_screencap())
+        self.assertEqual(self.btv._screencap_method, "native")
+
+    @awaiter
+    async def test_calibration_skips_undecodable_candidate(self):
+        async def mixed_shell(cmd):
+            return b"garbage" if cmd == framebuffer.RAW_SCREENCAP_COMMAND else self.gzipped
+
+        self.btv._adb.shell_binary = AsyncMock(side_effect=mixed_shell)
+        with patch("androidtv.basetv.basetv_async.monotonic", side_effect=[0, 1, 5, 5, 6]):
+            self.assertEqual(await self.btv.adb_screencap(), PNG_IMAGE)
+        self.assertEqual(self.btv._screencap_method, "native")
+
+
+class TestRgb565ByteOrder(unittest.TestCase):
+    def test_big_endian_host_byteswaps_pixels(self):
+        with patch.object(framebuffer.sys, "byteorder", "big"):
+            self.assertEqual(framebuffer._rgb565_to_rgb(b"\xf8\x00", 1), bytes([255, 0, 0]))
+
+
 class TestAdbScreencapAsync(unittest.TestCase):
     def setUp(self):
         self.btv = BaseTVAsync.__new__(BaseTVAsync)
